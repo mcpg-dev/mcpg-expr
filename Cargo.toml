@@ -1,0 +1,21 @@
+[package]
+name = "mcpg-expr"
+version = "0.1.0-beta.13"
+license = "Apache-2.0"
+edition = "2024"
+description = """
+Shared CEL-backed dynamic-value engine for mcpg. Provides
+`DynamicValue<String>` (compiled-once at register time, evaluated
+per-call) and `ExprContext` (the standard variable bag exposing
+`$arguments`, `$context.*`, `$tool_name`, `$env.*`, `$steps.*`).
+
+Originally lived as `apps/gateway/src/runtime/expr.rs`; extracted so
+backend plugins (HTTP, future SQL/NATS template hosts) can compile
+operator CEL the same way the gateway does, eliminating per-call
+spec_overrides serialization.
+"""
+
+[dependencies]
+anyhow = "1.0.98"
+cel = "0.13.0"
+serde_json = "1.0.145"
