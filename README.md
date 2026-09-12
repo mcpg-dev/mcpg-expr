@@ -31,6 +31,9 @@ credential-reference rules.
 - `resolve_env_in_string()` — the config-load pass. It substitutes `${env.VAR}`,
   errors on an unset variable, and leaves every other `${...}` form untouched for
   the request-time layers.
+- `resolve_secret_in_string()` — the same pass for `${secret.NAME}`, with the
+  value supplied by a host-provided lookup (the gateway reads a mounted
+  directory). A lookup error carries the name, never a value.
 - `json_to_cel()` / `cel_value_to_json()` — conversion between
   `serde_json::Value` and `cel::Value`.
 - `validate_header_name()` / `validate_header_value()` — an RFC 7230 token check
@@ -46,6 +49,7 @@ Variables are written bare inside the markers — `${arguments.x}`, `${env.X}`. 
 | `context.*` | request | map | `principal_id`, `trust_level`, `auth_provider`, `session_id`, `transport`, `roles`, `groups`, `scopes`, `attributes`. |
 | `steps.<id>.output` / `steps.<id>.is_error` | pipeline | value / bool | Prior pipeline-step results; bound only while a pipeline is executing. |
 | `env.<NAME>` | startup | string | Environment variables captured at config load. |
+| `secret.<NAME>` | startup | string | Mounted secrets, substituted at config load through the host's lookup. |
 
 `trust_level`, `principal_id`, `auth_provider`, and `identity_kind` are also
 bound as bare top-level aliases, so a flat policy-style expression evaluates

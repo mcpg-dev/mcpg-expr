@@ -1,7 +1,8 @@
 //! Unified expression engine for dynamic configuration values.
 //!
 //! Provides two resolution phases:
-//! 1. **Startup** — `${env.VAR_NAME}` references are resolved immediately when config loads.
+//! 1. **Startup** — `${env.VAR_NAME}` and `${secret.NAME}` references are resolved
+//!    immediately when config loads.
 //! 2. **Request-time** — Expressions containing `arguments`, `tool_name`, `context`, `steps`
 //!    are evaluated per-call via CEL.
 //!
@@ -24,6 +25,7 @@
 //! | `context.session_id` | Request | String? | Session ID |
 //! | `context.transport` | Request | String | Transport kind |
 //! | `env.VAR` | Startup | String | Environment variable |
+//! | `secret.NAME` | Startup | String | Mounted secret file (host-supplied lookup) |
 //! | `steps.ID.output` | Pipeline | Value | Step result |
 //! | `steps.ID.is_error` | Pipeline | Bool | Step error flag |
 //!
@@ -397,7 +399,7 @@ impl ExprContext {
 }
 
 // ---------------------------------------------------------------------------
-// Environment variable resolution (startup phase)
+// Config-load resolution: `${env.X}` and `${secret.X}`
 // ---------------------------------------------------------------------------
 
 /// Resolve `${env.VAR}` references in a string using real environment
@@ -409,7 +411,39 @@ impl ExprContext {
 /// untouched for the request-time layers. The marker end is matched
 /// nesting-aware, consistent with the CEL/cred parser.
 pub fn resolve_env_in_string(input: &str) -> Result<String> {
-    if !input.contains("${env.") {
+    resolve_marker_in_string(input, "${env.", "env var", &|name| {
+        std::env::var(name).with_context(|| format!("environment variable '{}' is not set", name))
+    })
+}
+
+/// Resolve `${secret.NAME}` references in a string through `lookup`.
+///
+/// Called at config-load time, alongside [`resolve_env_in_string`], with
+/// the same nesting-aware marker parsing. Every reference is replaced by
+/// the value `lookup` returns for its NAME; a lookup error propagates
+/// with the NAME attached. The value never appears in an error, so the
+/// message stays safe to log. Other `${...}` expressions pass through
+/// untouched for the request-time layers.
+pub fn resolve_secret_in_string(
+    input: &str,
+    lookup: &dyn Fn(&str) -> Result<String>,
+) -> Result<String> {
+    resolve_marker_in_string(input, "${secret.", "secret", &|name| {
+        lookup(name).with_context(|| format!("secret '{}' could not be resolved", name))
+    })
+}
+
+/// Shared walker for the config-load markers: replaces every
+/// `<marker>NAME}` with `lookup(NAME)` and copies everything else
+/// verbatim, so multibyte UTF-8 in surrounding text is preserved
+/// exactly.
+fn resolve_marker_in_string(
+    input: &str,
+    marker: &str,
+    label: &str,
+    lookup: &dyn Fn(&str) -> Result<String>,
+) -> Result<String> {
+    if !input.contains(marker) {
         return Ok(input.to_owned());
     }
 
@@ -418,28 +452,25 @@ pub fn resolve_env_in_string(input: &str) -> Result<String> {
     let bytes = input.as_bytes();
 
     while i < bytes.len() {
-        if bytes[i..].starts_with(b"${env.") {
+        if bytes[i..].starts_with(marker.as_bytes()) {
             // The `{` sits at i+1; find its matching `}` so a nested `${}`
             // inside the name doesn't truncate at the first brace.
-            let var_start = i + "${env.".len();
-            let end = find_matching_brace(input, i + 2)
-                .ok_or_else(|| anyhow::anyhow!("unclosed ${{env.}} reference at position {}", i))?;
-            let var_name = &input[var_start..end];
-            if var_name.is_empty() {
+            let name_start = i + marker.len();
+            let end = find_matching_brace(input, i + 2).ok_or_else(|| {
+                anyhow::anyhow!("unclosed {marker}}} reference at position {}", i)
+            })?;
+            let name = &input[name_start..end];
+            if name.is_empty() {
                 return Err(anyhow::anyhow!(
-                    "empty env var name in ${{env.}} at position {}",
+                    "empty {label} name in {marker}}} at position {}",
                     i
                 ));
             }
-            let value = std::env::var(var_name)
-                .with_context(|| format!("environment variable '{}' is not set", var_name))?;
-            result.push_str(&value);
+            result.push_str(&lookup(name)?);
             i = end + 1;
         } else {
-            // Copy verbatim up to the next marker so multibyte UTF-8 in
-            // surrounding text is preserved exactly.
             let next = input[i + 1..]
-                .find("${env.")
+                .find(marker)
                 .map(|pos| i + 1 + pos)
                 .unwrap_or(bytes.len());
             result.push_str(&input[i..next]);
@@ -828,6 +859,82 @@ mod tests {
         let result = resolve_env_in_string("${env.NEST${X}}");
         assert!(result.is_err());
         unsafe { std::env::remove_var("MCPG_EXPR_NEST_${X}") };
+    }
+
+    fn secret_lookup(name: &str) -> Result<String> {
+        match name {
+            "API_TOKEN" => Ok("tok-123".to_owned()),
+            "HOST" => Ok("db.internal".to_owned()),
+            _ => Err(anyhow::anyhow!("no such secret")),
+        }
+    }
+
+    #[test]
+    fn secret_resolution_inline_in_larger_string() {
+        let out = resolve_secret_in_string(
+            "Bearer ${secret.API_TOKEN} @ ${secret.HOST}/v1",
+            &secret_lookup,
+        )
+        .unwrap();
+        assert_eq!(out, "Bearer tok-123 @ db.internal/v1");
+    }
+
+    #[test]
+    fn secret_resolution_missing_key_names_key_never_value() {
+        let err = resolve_secret_in_string("x ${secret.MISSING} y", &secret_lookup).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("MISSING"), "{msg}");
+        assert!(msg.contains("no such secret"), "{msg}");
+        assert!(!msg.contains("tok-123"), "{msg}");
+    }
+
+    #[test]
+    fn secret_resolution_never_echoes_a_value_into_an_error() {
+        // A lookup that succeeds for one key and fails for the next must
+        // not carry the first key's value into the error.
+        let err = resolve_secret_in_string("${secret.API_TOKEN}:${secret.MISSING}", &secret_lookup)
+            .unwrap_err();
+        assert!(!format!("{err:#}").contains("tok-123"));
+    }
+
+    #[test]
+    fn secret_resolution_empty_name_fails() {
+        let err = resolve_secret_in_string("${secret.}", &secret_lookup).unwrap_err();
+        assert!(err.to_string().contains("empty secret name"), "{err}");
+    }
+
+    #[test]
+    fn secret_resolution_unclosed_reference_fails() {
+        let err = resolve_secret_in_string("${secret.API_TOKEN", &secret_lookup).unwrap_err();
+        assert!(err.to_string().contains("unclosed"), "{err}");
+    }
+
+    #[test]
+    fn secret_resolution_without_marker_passes_through() {
+        let called = std::cell::Cell::new(false);
+        let lookup = |_: &str| {
+            called.set(true);
+            Ok(String::new())
+        };
+        let input = "plain ${env.X} ${arguments.y} ${cred://a/b} café";
+        assert_eq!(resolve_secret_in_string(input, &lookup).unwrap(), input);
+        assert!(!called.get(), "lookup must not run without a marker");
+    }
+
+    #[test]
+    fn secret_resolution_matches_nested_brace() {
+        // The whole nested-brace name reaches the lookup (not truncated at
+        // the first `}`), exactly as the env resolver behaves.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let lookup = |name: &str| {
+            seen.borrow_mut().push(name.to_owned());
+            Ok("v".to_owned())
+        };
+        assert_eq!(
+            resolve_secret_in_string("${secret.NEST${X}}", &lookup).unwrap(),
+            "v"
+        );
+        assert_eq!(seen.borrow().as_slice(), ["NEST${X}"]);
     }
 
     #[test]
