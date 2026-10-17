@@ -38,6 +38,11 @@ credential-reference rules.
   `serde_json::Value` and `cel::Value`.
 - `validate_header_name()` / `validate_header_value()` — an RFC 7230 token check
   plus CR/LF rejection, so a resolved value cannot inject a header.
+- `governance::BackendGovernanceConfig` / `governance::TrustLevelConfig` — the
+  `governance` block of a gateway binding, federation or registry default
+  (trust floor, CEL `allow_if`, required scopes), with `validate()` and
+  `validate_allow_if()`, which compile the condition with the CEL compiler the
+  gateway's policy gate uses.
 
 Variables are written bare inside the markers — `${arguments.x}`, `${env.X}`. A
 `$`-prefixed spelling inside the braces is not accepted.
@@ -71,6 +76,8 @@ callback is keyed by the verbatim URI.
   `http`, `soap`, `command`, and `ldap` backends — for per-call URL, header, and
   argument resolution, so a cdylib compiles operator CEL exactly the way the
   gateway does.
+- `k8s/operator` — checks the `governance` block of an `MCPGServer` before it
+  writes it into a gateway's config, with the type the gateway reads it with.
 
 ## Usage
 

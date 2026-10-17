@@ -34,6 +34,8 @@
 //! URI scheme, which is resolved per-request by the
 //! gateway's credential resolver before the binding sees its config.
 
+pub mod governance;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
