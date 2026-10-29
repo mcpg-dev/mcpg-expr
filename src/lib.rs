@@ -680,15 +680,26 @@ pub fn cel_value_to_json(value: &CelValue) -> Value {
         CelValue::String(s) => Value::String(s.to_string()),
         CelValue::List(l) => Value::Array(l.iter().map(cel_value_to_json).collect()),
         CelValue::Map(m) => {
-            let mut obj = serde_json::Map::new();
-            for (k, v) in m.map.iter() {
-                let key_str = match k {
-                    CelKey::String(s) => s.to_string(),
-                    CelKey::Int(n) => n.to_string(),
-                    CelKey::Uint(n) => n.to_string(),
-                    CelKey::Bool(b) => b.to_string(),
-                };
-                obj.insert(key_str, cel_value_to_json(v));
+            // A CEL map is a hash map whose iteration order changes from one
+            // map to the next; the JSON object keeps insertion order, so the
+            // keys go in sorted to give every evaluation the same bytes.
+            let mut entries: Vec<(String, &CelValue)> = m
+                .map
+                .iter()
+                .map(|(k, v)| {
+                    let key = match k {
+                        CelKey::String(s) => s.to_string(),
+                        CelKey::Int(n) => n.to_string(),
+                        CelKey::Uint(n) => n.to_string(),
+                        CelKey::Bool(b) => b.to_string(),
+                    };
+                    (key, v)
+                })
+                .collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            let mut obj = serde_json::Map::with_capacity(entries.len());
+            for (key, v) in entries {
+                obj.insert(key, cel_value_to_json(v));
             }
             Value::Object(obj)
         }
@@ -1094,6 +1105,27 @@ mod tests {
         let cel = json_to_cel(&input);
         let back = cel_value_to_json(&cel);
         assert_eq!(input, back);
+    }
+
+    /// A map that went through CEL serialises the same way every time, keys
+    /// sorted, however each `HashMap` happened to hash.
+    #[test]
+    fn a_map_through_cel_has_one_key_order() {
+        let input = serde_json::json!({
+            "title": "t",
+            "status": 200,
+            "path": "/p",
+            "main": {"z": 1, "a": 2, "m": 3}
+        });
+        let first = serde_json::to_string(&cel_value_to_json(&json_to_cel(&input))).unwrap();
+        assert_eq!(
+            first,
+            r#"{"main":{"a":2,"m":3,"z":1},"path":"/p","status":200,"title":"t"}"#
+        );
+        for _ in 0..50 {
+            let again = serde_json::to_string(&cel_value_to_json(&json_to_cel(&input))).unwrap();
+            assert_eq!(again, first);
+        }
     }
 
     // --- header injection validation ---
