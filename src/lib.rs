@@ -24,6 +24,8 @@
 //! | `context.auth_provider` | Request | String? | Identity provider |
 //! | `context.session_id` | Request | String? | Session ID |
 //! | `context.transport` | Request | String | Transport kind |
+//! | `context.client_name` | Request | String? | MCP client's self-reported name (unverified) |
+//! | `context.client_version` | Request | String? | MCP client's self-reported version (unverified) |
 //! | `env.VAR` | Startup | String | Environment variable |
 //! | `secret.NAME` | Startup | String | Mounted secret file (host-supplied lookup) |
 //! | `steps.ID.output` | Pipeline | Value | Step result |
@@ -237,6 +239,10 @@ pub struct ExprRequestContext {
     pub auth_provider: Option<String>,
     pub session_id: Option<String>,
     pub transport: String,
+    /// The MCP client's self-reported name and version
+    /// (`context.client_name`, `context.client_version`); never verified.
+    pub client_name: Option<String>,
+    pub client_version: Option<String>,
     pub roles: Vec<String>,
     pub groups: Vec<String>,
     pub scopes: Vec<String>,
@@ -329,6 +335,18 @@ impl ExprContext {
             CelKey::String("transport".to_owned().into()),
             CelValue::String(self.context.transport.clone().into()),
         );
+        for (key, value) in [
+            ("client_name", &self.context.client_name),
+            ("client_version", &self.context.client_version),
+        ] {
+            map.insert(
+                CelKey::String(key.to_owned().into()),
+                match value {
+                    Some(v) => CelValue::String(v.clone().into()),
+                    None => CelValue::Null,
+                },
+            );
+        }
 
         // Claim-based identity fields
         let roles_cel: Vec<CelValue> = self
@@ -566,8 +584,13 @@ fn interpolation_to_cel(input: &str) -> Result<String> {
                 i += 1;
             }
             let segment = &input[seg_start..i];
-            // Escape quotes for CEL string literal
-            let escaped = segment.replace('\\', "\\\\").replace('"', "\\\"");
+            // A CEL double-quoted literal holds no raw line break.
+            let escaped = segment
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
             parts.push(format!("\"{}\"", escaped));
         }
     }
@@ -820,6 +843,20 @@ mod tests {
     }
 
     #[test]
+    fn multi_line_template_keeps_its_line_breaks() {
+        let template = "<Get>\n\t<City>${arguments.city}</City>\r\n</Get>\n";
+        let dv = DynamicValue::parse(template).unwrap();
+        let ctx = ExprContext {
+            arguments: serde_json::json!({"city": "Kyiv"}),
+            ..Default::default()
+        };
+        assert_eq!(
+            dv.resolve(&ctx).unwrap(),
+            "<Get>\n\t<City>Kyiv</City>\r\n</Get>\n"
+        );
+    }
+
+    #[test]
     fn env_resolution_at_startup() {
         // SAFETY: test-only, single-threaded env manipulation
         unsafe { std::env::set_var("MCPGTEST_HOST", "prod.example.com") };
@@ -1006,6 +1043,8 @@ mod tests {
                 auth_provider: Some("google".to_owned()),
                 session_id: Some("sess-1".to_owned()),
                 transport: "http".to_owned(),
+                client_name: Some("claude-code".to_owned()),
+                client_version: None,
                 roles: Vec::new(),
                 groups: Vec::new(),
                 scopes: Vec::new(),
@@ -1029,6 +1068,11 @@ mod tests {
 
         let dv = DynamicValue::parse("${context.trust_level}").unwrap();
         assert_eq!(dv.resolve(&ctx).unwrap(), "verified");
+
+        let dv = DynamicValue::parse("${context.client_name}").unwrap();
+        assert_eq!(dv.resolve(&ctx).unwrap(), "claude-code");
+        let dv = DynamicValue::parse("${context.client_version == null ? 'none' : 'set'}").unwrap();
+        assert_eq!(dv.resolve(&ctx).unwrap(), "none");
     }
 
     #[test]
